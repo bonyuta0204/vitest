@@ -8,10 +8,6 @@ const isBrowser = process.argv.includes('--browser')
 const isCI = process.env.GITHUB_ACTIONS
 process.env.COVERAGE_PROVIDER = provider
 
-// TODO: Fix flakiness and enable on CI -- browser picks test files that don't exist and fails, some tests fail because of the multi environment mismatch
-if (isCI)
-  process.exit(0)
-
 const poolConfigs = [
   { pool: 'threads', poolOptions: { threads: { } } },
   { pool: 'forks', poolOptions: { forks: { } } },
