@@ -11,9 +11,9 @@ import type { ViteDevServer } from 'vite'
 import type { StackTraceParserOptions } from '@vitest/utils/source-map'
 import { API_PATH } from '../constants'
 import type { Vitest } from '../node'
-import type { File, ModuleGraphData, Reporter, TaskResultPack, UserConsoleLog } from '../types'
+import type { File, ModuleGraphData, Reporter, ResolvedConfig, TaskResultPack, UserConsoleLog } from '../types'
 import { getModuleGraph, isPrimitive, stringifyReplace } from '../utils'
-import type { WorkspaceProject } from '../node/workspace'
+import { WorkspaceProject } from '../node/workspace'
 import { parseErrorStacktrace } from '../utils/source-map'
 import type { TransformResultWithSource, WebSocketEvents, WebSocketHandlers } from './types'
 
@@ -114,6 +114,9 @@ export function setup(vitestOrWorkspace: Vitest | WorkspaceProject, _server?: Vi
           await ctx.rerunFiles(files)
         },
         getConfig() {
+          if (vitestOrWorkspace instanceof WorkspaceProject)
+            return wrapConfig(vitestOrWorkspace.getSerializableConfig())
+
           return vitestOrWorkspace.config
         },
         async getTransformResult(id) {
@@ -143,6 +146,9 @@ export function setup(vitestOrWorkspace: Vitest | WorkspaceProject, _server?: Vi
         // browser should have a separate RPC in the future, UI doesn't care for provided context
         getProvidedContext() {
           return 'ctx' in vitestOrWorkspace ? vitestOrWorkspace.getProvidedContext() : ({} as any)
+        },
+        getUnhandledErrors() {
+          return ctx.state.getUnhandledErrors()
         },
       },
       {
@@ -203,9 +209,9 @@ class WebSocketReporter implements Reporter {
     })
   }
 
-  onFinished(files?: File[] | undefined) {
+  onFinished(files?: File[], errors?: unknown[]) {
     this.clients.forEach((client) => {
-      client.onFinished?.(files)
+      client.onFinished?.(files, errors)
     })
   }
 
@@ -213,5 +219,16 @@ class WebSocketReporter implements Reporter {
     this.clients.forEach((client) => {
       client.onUserConsoleLog?.(log)
     })
+  }
+}
+
+function wrapConfig(config: ResolvedConfig): ResolvedConfig {
+  return {
+    ...config,
+    // workaround RegExp serialization
+    testNamePattern:
+      config.testNamePattern
+        ? config.testNamePattern.toString() as any as RegExp
+        : undefined,
   }
 }

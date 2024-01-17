@@ -1,6 +1,7 @@
 import { parseAst } from 'rollup/parseAst'
-import { expect, test } from 'vitest'
-import { describe } from 'node:test'
+import { describe, expect, it, test } from 'vitest'
+import stripAnsi from 'strip-ansi'
+import { getDefaultColors } from '@vitest/utils'
 import { hoistMocks } from '../../../packages/vitest/src/node/hoistMocks'
 
 function parse(code: string, options: any) {
@@ -1181,5 +1182,152 @@ console.log(foo + 2)
       export * from './b'
       console.log(__vi_import_0__.foo + 2)"
     `)
+  })
+
+  test('handle single "await vi.hoisted"', async () => {
+    expect(
+      hoistSimpleCode(`
+import { vi } from 'vitest';
+1234;
+await vi
+  .hoisted(() => {});
+    `),
+    ).toMatchInlineSnapshot(`
+      "const { vi } = await import('vitest')
+      await vi
+        .hoisted(() => {});
+
+
+      1234;"
+    `)
+  })
+})
+
+describe('throws an error when nodes are incompatible', () => {
+  const getErrorWhileHoisting = (code: string) => {
+    try {
+      hoistMocks(code, '/test.js', parse, getDefaultColors())?.code.trim()
+    }
+    catch (err: any) {
+      return err
+    }
+  }
+
+  it.each([
+    [
+      'vi.hoisted is called inside vi.mock',
+      `\
+import { vi } from 'vitest'
+
+vi.mock('./mocked', () => {
+  const variable = vi.hoisted(() => 1)
+  console.log(variable)
+})
+`,
+    ],
+    [
+      'awaited vi.hoisted is called inside vi.mock',
+      `\
+import { vi } from 'vitest'
+
+vi.mock('./mocked', async () => {
+  await vi.hoisted(() => 1)
+})
+`,
+    ],
+    [
+      'awaited assigned vi.hoisted is called inside vi.mock',
+      `\
+import { vi } from 'vitest'
+
+vi.mock('./mocked', async () => {
+  const variable = await vi.hoisted(() => 1)
+})
+`,
+    ],
+    [
+      'vi.mock inside vi.hoisted',
+      `\
+import { vi } from 'vitest'
+
+vi.hoisted(() => {
+  vi.mock('./mocked')
+})
+`,
+    ],
+    [
+      'vi.mock is called inside assigned vi.hoisted',
+      `\
+import { vi } from 'vitest'
+
+const values = vi.hoisted(() => {
+  vi.mock('./mocked')
+})
+`,
+    ],
+    [
+      'vi.mock is called inside awaited vi.hoisted',
+      `\
+import { vi } from 'vitest'
+
+await vi.hoisted(async () => {
+  vi.mock('./mocked')
+})
+`,
+    ],
+    [
+      'vi.mock is called inside assigned awaited vi.hoisted',
+      `\
+import { vi } from 'vitest'
+
+const values = await vi.hoisted(async () => {
+  vi.mock('./mocked')
+})
+`,
+    ],
+    [
+      'vi.hoisted is exported as a named export',
+      `\
+import { vi } from 'vitest'
+
+export const values = vi.hoisted(async () => {
+  return {}
+})
+`,
+    ],
+    [
+      'vi.hoisted is exported as default',
+      `\
+import { vi } from 'vitest'
+
+export default vi.hoisted(() => {
+  return {}
+})
+`,
+    ],
+    [
+      'awaited vi.hoisted is exported as named export',
+      `\
+import { vi } from 'vitest'
+
+export const values = await vi.hoisted(async () => {
+  return {}
+})
+`,
+    ],
+    [
+      'awaited vi.hoisted is exported as default export',
+      `\
+import { vi } from 'vitest'
+
+export default await vi.hoisted(async () => {
+  return {}
+})
+`,
+    ],
+  ])('correctly throws an error if %s', (_, code) => {
+    const error = getErrorWhileHoisting(code)
+    expect(error.message).toMatchSnapshot()
+    expect(stripAnsi(error.frame)).toMatchSnapshot()
   })
 })

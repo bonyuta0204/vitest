@@ -1,8 +1,11 @@
 import MagicString from 'magic-string'
-import type { CallExpression, Identifier, ImportDeclaration, VariableDeclaration, Node as _Node } from 'estree'
+import type { AwaitExpression, CallExpression, ExportDefaultDeclaration, ExportNamedDeclaration, Identifier, ImportDeclaration, VariableDeclaration, Node as _Node } from 'estree'
 import { findNodeAround } from 'acorn-walk'
 import type { PluginContext } from 'rollup'
 import { esmWalker } from '@vitest/utils/ast'
+import type { Colors } from '@vitest/utils'
+import { highlightCode } from '../utils/colors'
+import { generateCodeFrame } from './error'
 
 export type Positioned<T> = T & {
   start: number
@@ -55,14 +58,13 @@ export function getBetterEnd(code: string, node: Node) {
   return end
 }
 
-const regexpHoistable = /^[ \t]*\b(vi|vitest)\s*\.\s*(mock|unmock|hoisted)\(/m
-const regexpAssignedHoisted = /=[ \t]*(\bawait|)[ \t]*\b(vi|vitest)\s*\.\s*hoisted\(/
+const regexpHoistable = /\b(vi|vitest)\s*\.\s*(mock|unmock|hoisted)\(/
 const hashbangRE = /^#!.*\n/
 
-export function hoistMocks(code: string, id: string, parse: PluginContext['parse']) {
-  const hasMocks = regexpHoistable.test(code) || regexpAssignedHoisted.test(code)
+export function hoistMocks(code: string, id: string, parse: PluginContext['parse'], colors?: Colors) {
+  const needHoisting = regexpHoistable.test(code)
 
-  if (!hasMocks)
+  if (!needHoisting)
     return
 
   const s = new MagicString(code)
@@ -147,7 +149,18 @@ export function hoistMocks(code: string, id: string, parse: PluginContext['parse
   }
 
   const declaredConst = new Set<string>()
-  const hoistedNodes: Node[] = []
+  const hoistedNodes: Positioned<CallExpression | VariableDeclaration | AwaitExpression>[] = []
+
+  function createSyntaxError(node: Positioned<Node>, message: string) {
+    const _error = new SyntaxError(message)
+    Error.captureStackTrace(_error, createSyntaxError)
+    return {
+      name: 'SyntaxError',
+      message: _error.message,
+      stack: _error.stack,
+      frame: generateCodeFrame(highlightCode(id, code, colors), 4, node.start + 1),
+    }
+  }
 
   esmWalker(ast, {
     onIdentifier(id, info, parentStack) {
@@ -188,6 +201,11 @@ export function hoistMocks(code: string, id: string, parse: PluginContext['parse
           hoistedNodes.push(node)
 
         if (methodName === 'hoisted') {
+          // check it's not a default export
+          const defaultExport = findNodeAround(ast, node.start, 'ExportDefaultDeclaration')?.node as Positioned<ExportDefaultDeclaration> | undefined
+          if (defaultExport?.declaration === node || (defaultExport?.declaration.type === 'AwaitExpression' && defaultExport.declaration.argument === node))
+            throw createSyntaxError(defaultExport, 'Cannot export hoisted variable. You can control hoisting behavior by placing the import from this file first.')
+
           const declarationNode = findNodeAround(ast, node.start, 'VariableDeclaration')?.node as Positioned<VariableDeclaration> | undefined
           const init = declarationNode?.declarations[0]?.init
           const isViHoisted = (node: CallExpression) => {
@@ -207,17 +225,68 @@ export function hoistMocks(code: string, id: string, parse: PluginContext['parse
                 && isViHoisted(init.argument)) /* const v = await vi.hoisted() */
 
           if (canMoveDeclaration) {
+            // export const variable = vi.hoisted()
+            const nodeExported = findNodeAround(ast, declarationNode.start, 'ExportNamedDeclaration')?.node as Positioned<ExportNamedDeclaration> | undefined
+            if (nodeExported?.declaration === declarationNode)
+              throw createSyntaxError(nodeExported, 'Cannot export hoisted variable. You can control hoisting behavior by placing the import from this file first.')
             // hoist "const variable = vi.hoisted(() => {})"
             hoistedNodes.push(declarationNode)
           }
           else {
-            // hoist "vi.hoisted(() => {})"
-            hoistedNodes.push(node)
+            const awaitedExpression = findNodeAround(ast, node.start, 'AwaitExpression')?.node as Positioned<AwaitExpression> | undefined
+            // hoist "await vi.hoisted(async () => {})" or "vi.hoisted(() => {})"
+            hoistedNodes.push(awaitedExpression?.argument === node ? awaitedExpression : node)
           }
         }
       }
     },
   })
+
+  function getNodeName(node: CallExpression) {
+    const callee = node.callee || {}
+    if (callee.type === 'MemberExpression' && isIdentifier(callee.property) && isIdentifier(callee.object))
+      return `${callee.object.name}.${callee.property.name}()`
+    return '"hoisted method"'
+  }
+
+  function getNodeCall(node: Node): Positioned<CallExpression> {
+    if (node.type === 'CallExpression')
+      return node
+    if (node.type === 'VariableDeclaration') {
+      const { declarations } = node
+      const init = declarations[0].init
+      if (init)
+        return getNodeCall(init as Node)
+    }
+    if (node.type === 'AwaitExpression') {
+      const { argument } = node
+      if (argument.type === 'CallExpression')
+        return getNodeCall(argument as Node)
+    }
+    return node as Positioned<CallExpression>
+  }
+
+  function createError(outsideNode: Node, insideNode: Node) {
+    const outsideCall = getNodeCall(outsideNode)
+    const insideCall = getNodeCall(insideNode)
+    throw createSyntaxError(
+      insideCall,
+      `Cannot call ${getNodeName(insideCall)} inside ${getNodeName(outsideCall)}: both methods are hoisted to the top of the file and not actually called inside each other.`,
+    )
+  }
+
+  // validate hoistedNodes doesn't have nodes inside other nodes
+  for (let i = 0; i < hoistedNodes.length; i++) {
+    const node = hoistedNodes[i]
+    for (let j = i + 1; j < hoistedNodes.length; j++) {
+      const otherNode = hoistedNodes[j]
+
+      if (node.start >= otherNode.start && node.end <= otherNode.end)
+        throw createError(otherNode, node)
+      if (otherNode.start >= node.start && otherNode.end <= node.end)
+        throw createError(node, otherNode)
+    }
+  }
 
   // Wait for imports to be hoisted and then hoist the mocks
   const hoistedCode = hoistedNodes.map((node) => {

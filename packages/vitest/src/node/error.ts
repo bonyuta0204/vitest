@@ -23,6 +23,7 @@ interface PrintErrorOptions {
 }
 
 export async function printError(error: unknown, project: WorkspaceProject | undefined, options: PrintErrorOptions) {
+  console.log('[printError] error:', error)
   const { showCodeFrame = true, fullStack = false, type } = options
   const logger = options.logger
   let e = error as ErrorWithDiff
@@ -58,9 +59,14 @@ export async function printError(error: unknown, project: WorkspaceProject | und
 
   const nearest = error instanceof TypeCheckError
     ? error.stacks[0]
-    : stacks.find(stack =>
-      project.getModuleById(stack.file)
-      && existsSync(stack.file),
+    : stacks.find((stack) => {
+      try {
+        return project.server && project.getModuleById(stack.file) && existsSync(stack.file)
+      }
+      catch {
+        return false
+      }
+    },
     )
 
   const errorProperties = getErrorProperties(e)
@@ -68,6 +74,8 @@ export async function printError(error: unknown, project: WorkspaceProject | und
   if (type)
     printErrorType(type, project.ctx)
   printErrorMessage(e, logger)
+  if (e.codeFrame)
+    logger.error(`${e.codeFrame}\n`)
 
   // E.g. AssertionError from assert does not set showDiff but has both actual and expected properties
   if (e.diff)
@@ -81,7 +89,7 @@ export async function printError(error: unknown, project: WorkspaceProject | und
     printStack(project, stacks, nearest, errorProperties, (s) => {
       if (showCodeFrame && s === nearest && nearest) {
         const sourceCode = readFileSync(nearest.file, 'utf-8')
-        logger.error(generateCodeFrame(sourceCode, 4, s.line, s.column))
+        logger.error(generateCodeFrame(sourceCode.length > 100_000 ? sourceCode : logger.highlight(nearest.file, sourceCode), 4, s))
       }
     })
   }
@@ -95,7 +103,7 @@ export async function printError(error: unknown, project: WorkspaceProject | und
   if (testName) {
     logger.error(c.red(`The latest test that might've caused the error is "${c.bold(testName)}". It might mean one of the following:`
     + '\n- The error was thrown, while Vitest was running this test.'
-    + '\n- This was the last recorded test before the error was thrown, if error originated after test finished its execution.'))
+    + '\n- If the error occurred after the test had been completed, this was the last documented test before it was thrown.'))
   }
   if (afterEnvTeardown) {
     logger.error(c.red('This error was caught after test environment was torn down. Make sure to cancel any running tasks before test finishes:'
@@ -124,6 +132,7 @@ const skipErrorProperties = new Set([
   'type',
   'showDiff',
   'diff',
+  'codeFrame',
   'actual',
   'expected',
   'diffOptions',
@@ -249,11 +258,10 @@ function printStack(
 export function generateCodeFrame(
   source: string,
   indent = 0,
-  lineNumber: number,
-  columnNumber: number,
+  loc: { line: number; column: number } | number,
   range = 2,
 ): string {
-  const start = positionToOffset(source, lineNumber, columnNumber)
+  const start = typeof loc === 'object' ? positionToOffset(source, loc.line, loc.column) : loc
   const end = start
   const lines = source.split(lineSplitRE)
   const nl = /\r\n/.test(source) ? 2 : 1
